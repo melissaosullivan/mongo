@@ -268,6 +268,19 @@ namespace mongo {
                                               std::string* subjectName,
                                               Date_t* serverNotAfter);
 
+            /*
+             * Ensure that the server x509 Extended Key Usage has both TLS Web Server 
+             * Authentication and TLS Client Server Authentication, if any Extended
+             * Key Usages are specified. 
+             */
+            bool _validateExtendedKeyUsage(X509* x509);
+
+            /*
+             * Ensure that server the x509 Key Usage extensions includes the Digital 
+             * Signature extension, if any Key Usage extensions are specified.
+             */
+            bool _validateKeyUsage(X509* x509);
+
             /** @return true if was successful, otherwise false */
             bool _setupPEM(SSL_CTX* context,
                            const std::string& keyFile,
@@ -699,6 +712,69 @@ namespace mongo {
             }
 
             *serverNotAfter = Date_t(notAfterMillis);
+            
+            if (!_validateExtendedKeyUsage(x509)) {
+                dbexit(EXIT_BADOPTIONS, 
+                       "The provided SSL certificate has invalid Extended Key Usage "
+                       "Extensions. If specified, extensions must include TLS Web "
+                       "Server Authentication and TLS Client Server Authentication.");
+            }
+
+            if (!_validateKeyUsage(x509)) {
+                dbexit(EXIT_BADOPTIONS,
+                       "The provided SSL certificate has invalid Key Usage Extensions. "
+                       "If specified, extensions must include Digital Signature.");
+            }
+        }
+
+        return true;
+    }
+
+    bool SSLManager::_validateExtendedKeyUsage(X509* x509) {
+        STACK_OF(ASN1_OBJECT) *extKeyUsageStack = 
+            (STACK_OF(ASN1_OBJECT) *) X509_get_ext_d2i(x509, NID_ext_key_usage, NULL, NULL);
+
+        if (sk_ASN1_OBJECT_num(extKeyUsageStack) == -1) {
+            // There are no Extended Key Usages specified.
+            return true;
+        }
+
+        bool serverExt = false;
+        bool clientExt = false;
+        int objID = 0;
+
+        while (sk_ASN1_OBJECT_num(extKeyUsageStack) > 0) {
+            objID = OBJ_obj2nid(sk_ASN1_OBJECT_pop(extKeyUsageStack));
+
+            // 129 is the object ID of the SSL/TLS Web Server Auth Extended Key Usage.
+            if (objID == 129) 
+                serverExt = true;
+
+            // 130 is the object ID of the SSL/TLS Web Client Auth Extended Key Usage.
+            if (objID == 130)
+                clientExt = true;
+
+            if (serverExt && clientExt)
+                return true;
+        }
+
+        return false;
+    }
+
+    bool SSLManager::_validateKeyUsage(X509* x509) {
+        ASN1_BIT_STRING *keyUsageBits = 
+            (ASN1_BIT_STRING *) X509_get_ext_d2i(x509, NID_key_usage, NULL, NULL);
+
+        int keyUsageIndex = 0;
+        // Check for Digital Signature Extension at index 0.
+        if (ASN1_BIT_STRING_get_bit(keyUsageBits, keyUsageIndex))
+            return true;
+
+        // If Digital Signature is not specified, make sure that non of 
+        // the other key usages (indexed from 1 to 8) are either.
+        for (keyUsageIndex = 1; keyUsageIndex < 9; keyUsageIndex++) {
+            if (ASN1_BIT_STRING_get_bit(keyUsageBits, keyUsageIndex))
+                return false;
         }
 
         return true;
