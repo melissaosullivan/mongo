@@ -731,53 +731,49 @@ namespace mongo {
     }
 
     bool SSLManager::_validateExtendedKeyUsage(X509* x509) {
-        STACK_OF(ASN1_OBJECT) *extKeyUsageStack = 
+        STACK_OF(ASN1_OBJECT) *ekuStack = 
             (STACK_OF(ASN1_OBJECT) *) X509_get_ext_d2i(x509, NID_ext_key_usage, NULL, NULL);
 
-        if (sk_ASN1_OBJECT_num(extKeyUsageStack) == -1) {
+        if (!ekuStack) {
             // There are no Extended Key Usages specified.
+            sk_ASN1_OBJECT_pop_free(ekuStack, ASN1_OBJECT_free);
             return true;
         }
 
         bool serverExt = false;
         bool clientExt = false;
-        int objID = 0;
 
-        while (sk_ASN1_OBJECT_num(extKeyUsageStack) > 0) {
-            objID = OBJ_obj2nid(sk_ASN1_OBJECT_pop(extKeyUsageStack));
+        for (int ekuIndex = 0; ekuIndex < sk_ASN1_OBJECT_num(ekuStack); ekuIndex++) {
+            int objID = OBJ_obj2nid(sk_ASN1_OBJECT_value(ekuStack, ekuIndex));
 
-            // 129 is the object ID of the SSL/TLS Web Server Auth Extended Key Usage.
-            if (objID == 129) 
+            if (objID == NID_server_auth)
                 serverExt = true;
 
-            // 130 is the object ID of the SSL/TLS Web Client Auth Extended Key Usage.
-            if (objID == 130)
+            if (objID == NID_client_auth)
                 clientExt = true;
-
-            if (serverExt && clientExt)
-                return true;
         }
 
-        return false;
+        sk_ASN1_OBJECT_pop_free(ekuStack, ASN1_OBJECT_free);
+        return serverExt && clientExt; 
     }
 
     bool SSLManager::_validateKeyUsage(X509* x509) {
         ASN1_BIT_STRING *keyUsageBits = 
             (ASN1_BIT_STRING *) X509_get_ext_d2i(x509, NID_key_usage, NULL, NULL);
 
-        int keyUsageIndex = 0;
-        // Check for Digital Signature Extension at index 0.
-        if (ASN1_BIT_STRING_get_bit(keyUsageBits, keyUsageIndex))
+        if (!keyUsageBits) {
+            ASN1_BIT_STRING_free(keyUsageBits);
             return true;
-
-        // If Digital Signature is not specified, make sure that non of 
-        // the other key usages (indexed from 1 to 8) are either.
-        for (keyUsageIndex = 1; keyUsageIndex < 9; keyUsageIndex++) {
-            if (ASN1_BIT_STRING_get_bit(keyUsageBits, keyUsageIndex))
-                return false;
         }
 
-        return true;
+        const int digitalSignatureBit = 0;
+        if (ASN1_BIT_STRING_get_bit(keyUsageBits, digitalSignatureBit)) {
+            ASN1_BIT_STRING_free(keyUsageBits);
+            return true;
+        }
+
+        ASN1_BIT_STRING_free(keyUsageBits);
+        return false;
     }
 
     bool SSLManager::_setupPEM(SSL_CTX* context, 
