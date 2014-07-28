@@ -269,17 +269,14 @@ namespace mongo {
                                               Date_t* serverNotAfter);
 
             /*
-             * Ensure that the server x509 Extended Key Usage has both TLS Web Server 
+             * Ensure that server the x509 Key Usage extensions includes the Digital 
+             * Signature extension, if any Key Usage extensions are specified. Also
+             * ensure that the server x509 Extended Key Usage has both TLS Web Server 
              * Authentication and TLS Client Server Authentication, if any Extended
              * Key Usages are specified. 
+             * @return string with error message or NULL for no error.
              */
-            bool _validateExtendedKeyUsage(X509* x509);
-
-            /*
-             * Ensure that server the x509 Key Usage extensions includes the Digital 
-             * Signature extension, if any Key Usage extensions are specified.
-             */
-            bool _validateKeyUsage(X509* x509);
+            std::string _validateKeyUsageAndExtendedKeyUsage(X509* x509);
 
             /** @return true if was successful, otherwise false */
             bool _setupPEM(SSL_CTX* context,
@@ -712,33 +709,35 @@ namespace mongo {
             }
 
             *serverNotAfter = Date_t(notAfterMillis);
-            
-            if (!_validateExtendedKeyUsage(x509)) {
-                dbexit(EXIT_BADOPTIONS, 
-                       "The provided SSL certificate has invalid Extended Key Usage "
-                       "Extensions. If specified, extensions must include TLS Web "
-                       "Server Authentication and TLS Client Server Authentication.");
-            }
-
-            if (!_validateKeyUsage(x509)) {
-                dbexit(EXIT_BADOPTIONS,
-                       "The provided SSL certificate has invalid Key Usage Extensions. "
-                       "If specified, extensions must include Digital Signature.");
+            std::string keyUsageError = _validateKeyUsageAndExtendedKeyUsage(x509);
+            if (keyUsageError != NULL) {
+                dbexit(EXIT_BADOPTIONS, keyUsageError.c_str());
             }
         }
 
         return true;
     }
 
-    bool SSLManager::_validateExtendedKeyUsage(X509* x509) {
+    std::string SSLManager::_validateKeyUsageAndExtendedKeyUsage(X509* x509) {
+
+        ASN1_BIT_STRING *keyUsageBits = 
+            (ASN1_BIT_STRING *) X509_get_ext_d2i(x509, NID_key_usage, NULL, NULL);
+
+        if (keyUsageBits) {
+            const int digitalSignatureBit = 0;
+            if (!(ASN1_BIT_STRING_get_bit(keyUsageBits, digitalSignatureBit))) {
+                ASN1_BIT_STRING_free(keyUsageBits);
+                return "The provided SSL certificate has invalid Key Usage Extensions. "
+                       "If specified, extensions must include Digital Signature.";
+            }
+            ASN1_BIT_STRING_free(keyUsageBits);
+        }
+
         STACK_OF(ASN1_OBJECT) *ekuStack = 
             (STACK_OF(ASN1_OBJECT) *) X509_get_ext_d2i(x509, NID_ext_key_usage, NULL, NULL);
 
-        if (!ekuStack) {
-            // There are no Extended Key Usages specified.
-            sk_ASN1_OBJECT_pop_free(ekuStack, ASN1_OBJECT_free);
-            return true;
-        }
+        if (!ekuStack)
+            return NULL;
 
         bool serverExt = false;
         bool clientExt = false;
@@ -754,26 +753,12 @@ namespace mongo {
         }
 
         sk_ASN1_OBJECT_pop_free(ekuStack, ASN1_OBJECT_free);
-        return serverExt && clientExt; 
-    }
-
-    bool SSLManager::_validateKeyUsage(X509* x509) {
-        ASN1_BIT_STRING *keyUsageBits = 
-            (ASN1_BIT_STRING *) X509_get_ext_d2i(x509, NID_key_usage, NULL, NULL);
-
-        if (!keyUsageBits) {
-            ASN1_BIT_STRING_free(keyUsageBits);
-            return true;
-        }
-
-        const int digitalSignatureBit = 0;
-        if (ASN1_BIT_STRING_get_bit(keyUsageBits, digitalSignatureBit)) {
-            ASN1_BIT_STRING_free(keyUsageBits);
-            return true;
-        }
-
-        ASN1_BIT_STRING_free(keyUsageBits);
-        return false;
+        if (serverExt && clientExt)
+            return NULL;
+        
+        return "The provided SSL certificate has invalid Extended Key Usage "
+               "Extensions. If specified, extensions must include TLS Web "
+               "Server Authentication and TLS Client Server Authentication.";
     }
 
     bool SSLManager::_setupPEM(SSL_CTX* context, 
