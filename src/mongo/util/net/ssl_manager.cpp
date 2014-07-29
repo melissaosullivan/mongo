@@ -710,7 +710,7 @@ namespace mongo {
 
             *serverNotAfter = Date_t(notAfterMillis);
             std::string keyUsageError = _validateKeyUsageAndExtendedKeyUsage(x509);
-            if (keyUsageError != NULL) {
+            if (keyUsageError != "") {
                 dbexit(EXIT_BADOPTIONS, keyUsageError.c_str());
             }
         }
@@ -737,7 +737,7 @@ namespace mongo {
             (STACK_OF(ASN1_OBJECT) *) X509_get_ext_d2i(x509, NID_ext_key_usage, NULL, NULL);
 
         if (!ekuStack)
-            return NULL;
+            return "";
 
         bool serverExt = false;
         bool clientExt = false;
@@ -754,7 +754,7 @@ namespace mongo {
 
         sk_ASN1_OBJECT_pop_free(ekuStack, ASN1_OBJECT_free);
         if (serverExt && clientExt)
-            return NULL;
+            return "";
         
         return "The provided SSL certificate has invalid Extended Key Usage "
                "Extensions. If specified, extensions must include TLS Web "
