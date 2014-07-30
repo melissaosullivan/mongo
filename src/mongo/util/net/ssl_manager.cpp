@@ -269,14 +269,14 @@ namespace mongo {
                                               Date_t* serverNotAfter);
 
             /*
-             * Ensure that server the x509 Key Usage extensions includes the Digital 
-             * Signature extension, if any Key Usage extensions are specified. Also
+             * Ensure that server the x509 Key Usage Extensions includes the Digital
+             * Signature extension, if any Key Usage Extensions are specified. Also
              * ensure that the server x509 Extended Key Usage has both TLS Web Server 
              * Authentication and TLS Client Server Authentication, if any Extended
              * Key Usages are specified. 
              * @return string with error message or NULL for no error.
              */
-            std::string _validateKeyUsageAndExtendedKeyUsage(X509* x509);
+            Status _validateKeyUsage(X509* x509);
 
             /** @return true if was successful, otherwise false */
             bool _setupPEM(SSL_CTX* context,
@@ -709,36 +709,40 @@ namespace mongo {
             }
 
             *serverNotAfter = Date_t(notAfterMillis);
-            std::string keyUsageError = _validateKeyUsageAndExtendedKeyUsage(x509);
-            if (keyUsageError != "") {
-                dbexit(EXIT_BADOPTIONS, keyUsageError.c_str());
-            }
+            Status keyUseCheck = _validateKeyUsage(x509);
+            if (!keyUseCheck.isOK())
+                dbexit(EXIT_BADOPTIONS, keyUseCheck.reason().c_str();
         }
 
         return true;
     }
 
-    std::string SSLManager::_validateKeyUsageAndExtendedKeyUsage(X509* x509) {
-
+    Status SSLManager::_validateKeyUsage(X509* x509) {
+        //Retrieve key usage.
         ASN1_BIT_STRING *keyUsageBits = 
             (ASN1_BIT_STRING *) X509_get_ext_d2i(x509, NID_key_usage, NULL, NULL);
 
+        //Check that key usage is specified.
         if (keyUsageBits) {
+            ON_BLOCK_EXIT(ASN1_BIT_STRING_free, keyUsageBits);
             const int digitalSignatureBit = 0;
+            //Check that key usage includes digital signature.
             if (!(ASN1_BIT_STRING_get_bit(keyUsageBits, digitalSignatureBit))) {
-                ASN1_BIT_STRING_free(keyUsageBits);
-                return "The provided SSL certificate has invalid Key Usage Extensions. "
-                       "If specified, extensions must include Digital Signature.";
+                return Status(ErrorCodes::InvalidOptions,
+                              "The provided SSL certificate has invalid Key Usage Extensions. "
+                              "If specified, extensions must include Digital Signature.");
             }
-            ASN1_BIT_STRING_free(keyUsageBits);
         }
 
+        //Retrieve extended key usage.
         STACK_OF(ASN1_OBJECT) *ekuStack = 
             (STACK_OF(ASN1_OBJECT) *) X509_get_ext_d2i(x509, NID_ext_key_usage, NULL, NULL);
 
+        //Check that extended key usage is specified.
         if (!ekuStack)
-            return "";
+            return Status::OK();
 
+       // Check that extended key usage purposes include serverAuth and clientAuth.
         bool serverExt = false;
         bool clientExt = false;
 
@@ -754,11 +758,12 @@ namespace mongo {
 
         sk_ASN1_OBJECT_pop_free(ekuStack, ASN1_OBJECT_free);
         if (serverExt && clientExt)
-            return "";
+            return Status::OK();
         
-        return "The provided SSL certificate has invalid Extended Key Usage "
-               "Extensions. If specified, extensions must include TLS Web "
-               "Server Authentication and TLS Client Server Authentication.";
+        return Status(ErrorCodes::InvalidOptions,
+                      "The provided SSL certificate has invalid Extended Key Usage "
+                      "Extensions. If specified, extensions must include TLS Web "
+                      "Server Authentication and TLS Client Server Authentication.");
     }
 
     bool SSLManager::_setupPEM(SSL_CTX* context, 
