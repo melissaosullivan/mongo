@@ -266,17 +266,23 @@ namespace mongo {
              */
             bool _parseAndValidateCertificate(const std::string& keyFile,
                                               std::string* subjectName,
-                                              Date_t* serverNotAfter);
+                                              Date_t* serverNotAfter,
+                                              const int extendedKeyUsePurpose);
 
             /*
-             * Ensure that server the x509 Key Usage Extensions includes the Digital
-             * Signature extension, if any Key Usage Extensions are specified. Also
-             * ensure that the server x509 Extended Key Usage has both TLS Web Server 
-             * Authentication and TLS Client Server Authentication, if any Extended
-             * Key Usages are specified. 
-             * @return string with error message or NULL for no error.
+             * Ensure that the x509 certificate Key Usage includes Digital Signature.
+             * @return Status::OK() if Digital Signature is present, Status with
+             * InvalidOptions Error otherwise.
              */
             Status _validateKeyUsage(X509* x509);
+
+            /*
+             * Ensure that x509 certificate has Extended Key Usage Purpose identified
+             * by extendedKeyUsePurposeID.
+             * @return Status::OK() if purpose is found, or Status with InvalidOptions
+             * Error otherwise.
+             */
+            Status _validateExtendedKeyUsage(X509* x509, const int extendedKeyUsePurposeID);
 
             /** @return true if was successful, otherwise false */
             bool _setupPEM(SSL_CTX* context,
@@ -448,7 +454,10 @@ namespace mongo {
             _serverContext = NULL;
 
             if (!params.pemfile.empty()) {
-                if (!_parseAndValidateCertificate(params.pemfile, &_clientSubjectName, NULL)) {
+                if (!_parseAndValidateCertificate(params.pemfile,
+                                                  &_clientSubjectName,
+                                                  NULL,
+                                                  NID_client_auth)) {
                     uasserted(16941, "ssl initialization problem"); 
                 }
             }
@@ -460,22 +469,25 @@ namespace mongo {
             }
 
             Date_t notAfter = Date_t();
-            if (!_parseAndValidateCertificate(params.pemfile, &_serverSubjectName, &notAfter)) {
+            if (!_parseAndValidateCertificate(params.pemfile,
+                                              &_serverSubjectName,
+                                              &notAfter,
+                                              NID_server_auth)) {
                 uasserted(16942, "ssl initialization problem"); 
             }
 
             static CertificateExpirationMonitor task = CertificateExpirationMonitor(notAfter);
             // use the cluster certificate for outgoing connections if specified
             if (!params.clusterfile.empty()) {
-                if (!_parseAndValidateCertificate(params.clusterfile, &_clientSubjectName, NULL)) {
+                if (!_parseAndValidateCertificate(params.clusterfile,
+                                                  &_clientSubjectName,
+                                                  NULL,
+                                                  NID_client_auth)) {
                     uasserted(16943, "ssl initialization problem"); 
                 }
             }
-            else { 
-                if (!_parseAndValidateCertificate(params.pemfile, &_clientSubjectName, NULL)) {
-                    uasserted(16944, "ssl initialization problem"); 
-                }
-            }
+            else
+                _clientSubjectName = _serverSubjectName;
         }
     }
 
@@ -664,7 +676,8 @@ namespace mongo {
 
     bool SSLManager::_parseAndValidateCertificate(const std::string& keyFile, 
                                                   std::string* subjectName,
-                                                  Date_t* serverNotAfter) {
+                                                  Date_t* serverNotAfter,
+                                                  const int extendedKeyUsePurposeID) {
         BIO *inBIO = BIO_new(BIO_s_file_internal());
         if (inBIO == NULL) {
             error() << "failed to allocate BIO object: "
@@ -686,6 +699,14 @@ namespace mongo {
             return false;
         }
         ON_BLOCK_EXIT(X509_free, x509);
+
+        Status keyUseCheck = _validateKeyUsage(x509);
+        if (!keyUseCheck.isOK())
+            dbexit(EXIT_BADOPTIONS, keyUseCheck.reason().c_str());
+
+        Status extendedKeyUseCheck = _validateExtendedKeyUsage(x509, extendedKeyUsePurposeID);
+        if (!extendedKeyUseCheck.isOK())
+            dbexit(EXIT_BADOPTIONS, extendedKeyUseCheck.reason().c_str());
 
         *subjectName = getCertificateSubjectName(x509);
         if (serverNotAfter != NULL) {
@@ -709,9 +730,6 @@ namespace mongo {
             }
 
             *serverNotAfter = Date_t(notAfterMillis);
-            Status keyUseCheck = _validateKeyUsage(x509);
-            if (!keyUseCheck.isOK())
-                dbexit(EXIT_BADOPTIONS, keyUseCheck.reason().c_str();
         }
 
         return true;
@@ -723,17 +741,22 @@ namespace mongo {
             (ASN1_BIT_STRING *) X509_get_ext_d2i(x509, NID_key_usage, NULL, NULL);
 
         //Check that key usage is specified.
-        if (keyUsageBits) {
-            ON_BLOCK_EXIT(ASN1_BIT_STRING_free, keyUsageBits);
-            const int digitalSignatureBit = 0;
-            //Check that key usage includes digital signature.
-            if (!(ASN1_BIT_STRING_get_bit(keyUsageBits, digitalSignatureBit))) {
-                return Status(ErrorCodes::InvalidOptions,
-                              "The provided SSL certificate has invalid Key Usage Extensions. "
-                              "If specified, extensions must include Digital Signature.");
-            }
-        }
+        if (!keyUsageBits)
+            return Status::OK();
 
+        ON_BLOCK_EXIT(ASN1_BIT_STRING_free, keyUsageBits);
+
+        //Check that key usage includes digital signature.
+        const int digitalSignatureBit = 0;
+        if (ASN1_BIT_STRING_get_bit(keyUsageBits, digitalSignatureBit))
+            return Status::OK();
+
+        return Status(ErrorCodes::InvalidOptions,
+                      "The provided SSL certificate has invalid Key Usage Extensions. "
+                      "If specified, extensions must include Digital Signature.");  
+    }
+
+    Status SSLManager::_validateExtendedKeyUsage(X509* x509, const int extendedKeyUsePurposeID) {
         //Retrieve extended key usage.
         STACK_OF(ASN1_OBJECT) *ekuStack = 
             (STACK_OF(ASN1_OBJECT) *) X509_get_ext_d2i(x509, NID_ext_key_usage, NULL, NULL);
@@ -742,28 +765,23 @@ namespace mongo {
         if (!ekuStack)
             return Status::OK();
 
-       // Check that extended key usage purposes include serverAuth and clientAuth.
-        bool serverExt = false;
-        bool clientExt = false;
-
+        // Check that extended key usage includes required purpose.
         for (int ekuIndex = 0; ekuIndex < sk_ASN1_OBJECT_num(ekuStack); ekuIndex++) {
             int objID = OBJ_obj2nid(sk_ASN1_OBJECT_value(ekuStack, ekuIndex));
 
-            if (objID == NID_server_auth)
-                serverExt = true;
-
-            if (objID == NID_client_auth)
-                clientExt = true;
+            if (objID == extendedKeyUsePurposeID) {
+                sk_ASN1_OBJECT_pop_free(ekuStack, ASN1_OBJECT_free);
+                return Status::OK();
+            }
         }
 
         sk_ASN1_OBJECT_pop_free(ekuStack, ASN1_OBJECT_free);
-        if (serverExt && clientExt)
-            return Status::OK();
-        
-        return Status(ErrorCodes::InvalidOptions,
-                      "The provided SSL certificate has invalid Extended Key Usage "
-                      "Extensions. If specified, extensions must include TLS Web "
-                      "Server Authentication and TLS Client Server Authentication.");
+        std::ostringstream ekuErrorSS;
+        ekuErrorSS << "The provided SSL certificate has invalid Extended Key Usage Extensions. "
+                   << "If specified, extensions must include "
+                   << OBJ_nid2ln(extendedKeyUsePurposeID) << ".";
+        std::string errorMessage = ekuErrorSS.str();
+        return Status(ErrorCodes::InvalidOptions, errorMessage);
     }
 
     bool SSLManager::_setupPEM(SSL_CTX* context, 
