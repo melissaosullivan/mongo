@@ -259,6 +259,11 @@ namespace mongo {
              */
             unsigned long long _convertASN1ToMillis(ASN1_TIME* t);
 
+            bool _getCertAndSetSubjectName(const std::string& keyFile,
+                                           X509* x509, 
+                                           std::string* subjectName);
+
+
             /*
              * Parse and store x509 subject name from the PEM keyfile.
              * For server instances check that PEM certificate is not expired
@@ -274,7 +279,7 @@ namespace mongo {
              * @return Status::OK() if Digital Signature is present, Status with
              * InvalidOptions Error otherwise.
              */
-            Status _validateKeyUsage(X509* x509);
+            bool _validateKeyUsage(X509* x509);
 
             /*
              * Ensure that x509 certificate has Extended Key Usage Purpose identified
@@ -282,7 +287,13 @@ namespace mongo {
              * @return Status::OK() if purpose is found, or Status with InvalidOptions
              * Error otherwise.
              */
-            Status _validateExtendedKeyUsage(X509* x509, const int extendedKeyUsePurposeID);
+            bool _validateExtendedKeyUsage(X509* x509, const int extendedKeyUsePurposeID);
+
+
+            bool _checkDateValidity(X509* x509);
+
+            void _startExpirationMonitor(X509* x509);
+
 
             /** @return true if was successful, otherwise false */
             bool _setupPEM(SSL_CTX* context,
@@ -379,8 +390,7 @@ namespace mongo {
         else {
             log() << "failed to convert subject name to RFC2253 format" << endl;
         }
-
-        return result;
+    return result;
     }
 
     SSLConnection::SSLConnection(SSL_CTX* context, 
@@ -454,12 +464,13 @@ namespace mongo {
             _serverContext = NULL;
 
             if (!params.pemfile.empty()) {
-                if (!_parseAndValidateCertificate(params.pemfile,
-                                                  &_clientSubjectName,
-                                                  NULL,
-                                                  NID_client_auth)) {
-                    uasserted(16941, "ssl initialization problem"); 
-                }
+                X509* mongoShellCert = NULL;
+
+                if (!_getCertAndSetSubjectName(params.pemfile, mongoShellCert, &_clientSubjectName))
+                    uasserted(16941, "ssl initialization problem");
+
+                ON_BLOCK_EXIT(X509_free, mongoShellCert);
+                //TODO: add key usage auth or eku auth if wanted
             }
         }
         // SSL server specific initialization
@@ -468,26 +479,41 @@ namespace mongo {
                 uasserted(16562, "ssl initialization problem"); 
             }
 
-            Date_t notAfter = Date_t();
-            if (!_parseAndValidateCertificate(params.pemfile,
-                                              &_serverSubjectName,
-                                              &notAfter,
-                                              NID_server_auth)) {
-                uasserted(16942, "ssl initialization problem"); 
+            X509* mongoServerCert = NULL;
+            if(!_getCertAndSetSubjectName(params.pemfile, mongoServerCert, &_serverSubjectName))
+                uasserted(16942, "ssl initialization problem");
+
+            ON_BLOCK_EXIT(X509_free, mongoServerCert);
+            /* TODO: key use stuff
+            // Add key use validate stuff.
+            Status keyUseCheck = _validateKeyUsage(mongodCert);
+            if (!keyUseCheck.isOK())
+                dbexit(EXIT_BADOPTIONS, keyUseCheck.reason().c_str());
+
+            Status extendedKeyUseCheck = _validateExtendedKeyUsage(x509, NID_client_auth);
+            if (!extendedKeyUseCheck.isOK())
+                dbexit(EXIT_BADOPTIONS, extendedKeyUseCheck.reason().c_str());
+            */
+
+            if (_checkDateValidity(mongoServerCert)) {
+                dbexit(EXIT_BADOPTIONS,
+                       "The provided SSL certificate is expired or not yet valid.");
             }
 
-            static CertificateExpirationMonitor task = CertificateExpirationMonitor(notAfter);
+            _startExpirationMonitor(mongoServerCert);
+
             // use the cluster certificate for outgoing connections if specified
             if (!params.clusterfile.empty()) {
-                if (!_parseAndValidateCertificate(params.clusterfile,
-                                                  &_clientSubjectName,
-                                                  NULL,
-                                                  NID_client_auth)) {
-                    uasserted(16943, "ssl initialization problem"); 
-                }
+                X509* mongoClientCert = NULL;
+                if (!_getCertAndSetSubjectName(params.clusterfile, mongoClientCert, &_clientSubjectName))
+                    uasserted(16943, "ssl initialization problem");
+
+                ON_BLOCK_EXIT(X509_free, mongoClientCert);
+                //*key usage n stuff
             }
-            else
+            else {
                 _clientSubjectName = _serverSubjectName;
+            }
         }
     }
 
@@ -674,6 +700,34 @@ namespace mongo {
         return (posixTime - boost::posix_time::ptime(epoch)).total_milliseconds();
     }
 
+    bool SSLManager::_getCertAndSetSubjectName(const std::string& keyFile,
+                                               X509* x509,
+                                               std::string* subjectName) {
+        BIO *inBIO = BIO_new(BIO_s_file_internal());
+        if (inBIO == NULL) {
+            error() << "failed to allocate BIO object: "
+                    << getSSLErrorMessage(ERR_get_error());
+            return false;
+        }
+
+        ON_BLOCK_EXIT(BIO_free, inBIO);
+        if (BIO_read_filename(inBIO, keyFile.c_str()) <= 0) {
+            error() << "cannot read key file when setting subject name: "
+                    << keyFile << ' ' << getSSLErrorMessage(ERR_get_error());
+            return false;
+        }
+
+        x509 = PEM_read_bio_X509(inBIO, NULL, &SSLManager::password_cb, this);
+        if (x509 == NULL) {
+            error() << "cannot retrieve certificate from keyfile: "
+                    << keyFile << ' ' << getSSLErrorMessage(ERR_get_error()); 
+            return false;
+        }
+        
+        *subjectName = getCertificateSubjectName(x509);
+        return true;
+    }
+/*
     bool SSLManager::_parseAndValidateCertificate(const std::string& keyFile, 
                                                   std::string* subjectName,
                                                   Date_t* serverNotAfter,
@@ -733,37 +787,35 @@ namespace mongo {
         }
 
         return true;
-    }
+    }*/
 
-    Status SSLManager::_validateKeyUsage(X509* x509) {
+    bool SSLManager::_validateKeyUsage(X509* x509) {
         //Retrieve key usage.
         ASN1_BIT_STRING *keyUsageBits = 
             (ASN1_BIT_STRING *) X509_get_ext_d2i(x509, NID_key_usage, NULL, NULL);
 
         //Check that key usage is specified.
         if (!keyUsageBits)
-            return Status::OK();
+            return true;
 
         ON_BLOCK_EXIT(ASN1_BIT_STRING_free, keyUsageBits);
 
         //Check that key usage includes digital signature.
         const int digitalSignatureBit = 0;
         if (ASN1_BIT_STRING_get_bit(keyUsageBits, digitalSignatureBit))
-            return Status::OK();
+            return true;
 
-        return Status(ErrorCodes::InvalidOptions,
-                      "The provided SSL certificate has invalid Key Usage Extensions. "
-                      "If specified, extensions must include Digital Signature.");  
+        return false;
     }
 
-    Status SSLManager::_validateExtendedKeyUsage(X509* x509, const int extendedKeyUsePurposeID) {
+    bool SSLManager::_validateExtendedKeyUsage(X509* x509, const int extendedKeyUsePurposeID) {
         //Retrieve extended key usage.
         STACK_OF(ASN1_OBJECT) *ekuStack = 
             (STACK_OF(ASN1_OBJECT) *) X509_get_ext_d2i(x509, NID_ext_key_usage, NULL, NULL);
 
         //Check that extended key usage is specified.
         if (!ekuStack)
-            return Status::OK();
+            return true;
 
         // Check that extended key usage includes required purpose.
         for (int ekuIndex = 0; ekuIndex < sk_ASN1_OBJECT_num(ekuStack); ekuIndex++) {
@@ -771,17 +823,43 @@ namespace mongo {
 
             if (objID == extendedKeyUsePurposeID) {
                 sk_ASN1_OBJECT_pop_free(ekuStack, ASN1_OBJECT_free);
-                return Status::OK();
+                return true;
             }
         }
 
         sk_ASN1_OBJECT_pop_free(ekuStack, ASN1_OBJECT_free);
-        std::ostringstream ekuErrorSS;
-        ekuErrorSS << "The provided SSL certificate has invalid Extended Key Usage Extensions. "
-                   << "If specified, extensions must include "
-                   << OBJ_nid2ln(extendedKeyUsePurposeID) << ".";
-        std::string errorMessage = ekuErrorSS.str();
-        return Status(ErrorCodes::InvalidOptions, errorMessage);
+        return false;
+    }
+
+    bool SSLManager::_checkDateValidity(X509* x509) {
+            unsigned long long notBeforeMillis = _convertASN1ToMillis(X509_get_notBefore(x509));
+            if (notBeforeMillis == 0) {
+                error() << "date conversion failed";
+                //return false;
+            }
+
+            unsigned long long notAfterMillis = _convertASN1ToMillis(X509_get_notAfter(x509));
+            if (notAfterMillis == 0) {
+                error() << "date conversion failed";
+                //return false;
+            }
+
+            if ((notBeforeMillis > curTimeMillis64()) ||
+                (curTimeMillis64() > notAfterMillis)) {
+                return false;
+            }
+            return true;
+    }
+
+    void SSLManager::_startExpirationMonitor(X509 *x509) {
+        unsigned long long notAfterMillis = _convertASN1ToMillis(X509_get_notAfter(x509));
+        if (notAfterMillis == 0) {
+            error() << "date conversion failed";
+            //return false;
+        }
+
+        Date_t serverNotAfter = Date_t(notAfterMillis);
+        static CertificateExpirationMonitor task = CertificateExpirationMonitor(serverNotAfter);
     }
 
     bool SSLManager::_setupPEM(SSL_CTX* context, 
