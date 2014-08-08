@@ -225,10 +225,13 @@ namespace mongo {
 
             virtual void SSL_free(SSLConnection* conn);
 
+            void setPemPassword(std::string password);
+
         private:
             SSL_CTX* _serverContext;  // SSL context for incoming connections
             SSL_CTX* _clientContext;  // SSL context for outgoing connections
-            std::string _password;
+            std::string _pemPassword;
+            std::string _clusterPassword;
             bool _validateCertificates;
             bool _weakValidation;
             bool _allowInvalidCertificates;
@@ -266,12 +269,14 @@ namespace mongo {
              */
             bool _parseAndValidateCertificate(const std::string& keyFile,
                                               std::string* subjectName,
-                                              Date_t* serverNotAfter);
+                                              Date_t* serverNotAfter,
+                                              bool clusterCert);
 
             /** @return true if was successful, otherwise false */
             bool _setupPEM(SSL_CTX* context,
                            const std::string& keyFile,
-                           const std::string& password);
+                           const std::string& password,
+                           bool clusterCert);
 
             /*
              * Set up an SSL context for certificate validation by loading a CA
@@ -308,7 +313,8 @@ namespace mongo {
             /**
              * Callbacks for SSL functions
              */
-            static int password_cb( char *buf,int num, int rwflag,void *userdata );
+            static int pem_password_cb(char *buf, int num, int rwflag, void *userdata);
+            static int cluster_password_cb(char *buf, int num, int rwflag, void *userdata);
             static int verify_cb(int ok, X509_STORE_CTX *ctx);
 
         };
@@ -438,7 +444,7 @@ namespace mongo {
             _serverContext = NULL;
 
             if (!params.pemfile.empty()) {
-                if (!_parseAndValidateCertificate(params.pemfile, &_clientSubjectName, NULL)) {
+                if (!_parseAndValidateCertificate(params.pemfile, &_clientSubjectName, NULL, false)) {
                     uasserted(16941, "ssl initialization problem"); 
                 }
             }
@@ -450,19 +456,19 @@ namespace mongo {
             }
 
             Date_t notAfter = Date_t();
-            if (!_parseAndValidateCertificate(params.pemfile, &_serverSubjectName, &notAfter)) {
+            if (!_parseAndValidateCertificate(params.pemfile, &_serverSubjectName, &notAfter, false)) {
                 uasserted(16942, "ssl initialization problem"); 
             }
 
             static CertificateExpirationMonitor task = CertificateExpirationMonitor(notAfter);
             // use the cluster certificate for outgoing connections if specified
             if (!params.clusterfile.empty()) {
-                if (!_parseAndValidateCertificate(params.clusterfile, &_clientSubjectName, NULL)) {
+                if (!_parseAndValidateCertificate(params.clusterfile, &_clientSubjectName, NULL, true)) {
                     uasserted(16943, "ssl initialization problem"); 
                 }
             }
             else { 
-                if (!_parseAndValidateCertificate(params.pemfile, &_clientSubjectName, NULL)) {
+                if (!_parseAndValidateCertificate(params.pemfile, &_clientSubjectName, NULL, false)) {
                     uasserted(16944, "ssl initialization problem"); 
                 }
             }
@@ -482,11 +488,39 @@ namespace mongo {
         }
     }
 
-    int SSLManager::password_cb(char *buf,int num, int rwflag,void *userdata) {
+    int SSLManager::pem_password_cb(char *buf, int num, int rwflag, void *userdata) {
         // Unless OpenSSL misbehaves, num should always be positive
+
+        fassert(17314, num > 0);
+        sslManager* sm = sm->static_cast<SSLManager*>(userdata);
+        if (_pemPassword.empty()) {
+                char buf[100];
+                EVP_read_pw_string(buf, 100, "Enter PEM certificate passphrase ", 0);
+                std::string bufstring(buf);
+                _pemPassword = bufstring;
+        }
+
         fassert(17314, num > 0);
         SSLManager* sm = static_cast<SSLManager*>(userdata);
-        const size_t copied = sm->_password.copy(buf, num - 1);
+        const size_t copied = sm->_pemPassword.copy(buf, num - 1);
+        buf[copied] = '\0';
+        return copied;
+    }
+
+    int SSLManager::cluster_password_cb(char *buf, int num, int rwflag, void *userdata) {
+        // Unless OpenSSL misbehaves, num should always be positive
+        fassert(18642, num > 0);
+        SSLManager* sm = static_cast<SSLManager*>(userdata);
+        if (sm->_clusterPassword.empty()) {
+                char buf[100];
+                EVP_read_pw_string(buf, 100, "Enter cluster certificate passphrase ", 0);
+                SSLManager manager = getSSLManager();
+                manager->setPemPassword()
+                std::string bufstring(buf);
+                sm->_clusterPassword = bufstring;
+        }
+
+        const size_t copied = sm->_clusterPassword.copy(buf, num - 1);
         buf[copied] = '\0';
         return copied;
     }
@@ -544,6 +578,10 @@ namespace mongo {
         return ::SSL_free(conn->ssl);
     }
 
+    void sslManager::setPemPassword(std::string password){
+        _pemPassword = password;
+    }
+
     void SSLManager::_setupFIPS() {
         // Turn on FIPS mode if requested.
         // OPENSSL_FIPS must be defined by the OpenSSL headers, plus MONGO_SSL_FIPS
@@ -588,29 +626,15 @@ namespace mongo {
  
         // Use the clusterfile for internal outgoing SSL connections if specified 
         if (context == &_clientContext && !params.clusterfile.empty()) {
-            if (params.clusterpwd.empty()) {
-                char buf[100];
-                EVP_read_pw_string(buf, 100, "Enter cluster certificate passphrase ", 0);
-                std::string bufstring(buf);
-                _password = bufstring;
-            }
-            if (!_setupPEM(*context, params.clusterfile, params.clusterpwd)) {
+
+            if (!_setupPEM(*context, params.clusterfile, params.clusterpwd, true)) {
                 return false;
             }
-            _password = "";
         }
-
         else if (!params.pemfile.empty()) {
-            if (params.pempwd.empty()) {
-                if (_password.empty() ) { 
-                    char bufs[100];
-                    EVP_read_pw_string(bufs, 100, "Enter PEM passphrase ", 0);
-                    std::string bufstrings(bufs);
-                    _password = bufstrings;
-                }
-                if (!_setupPEM(*context, params.pemfile, params.pempwd)) {
-                    return false;
-                }
+
+            if (!_setupPEM(*context, params.pemfile, params.pempwd, false)) {
+                return false;
             }
         }
 
@@ -669,7 +693,8 @@ namespace mongo {
 
     bool SSLManager::_parseAndValidateCertificate(const std::string& keyFile, 
                                                   std::string* subjectName,
-                                                  Date_t* serverNotAfter) {
+                                                  Date_t* serverNotAfter,
+                                                  bool clusterCert) {
         BIO *inBIO = BIO_new(BIO_s_file_internal());
         if (inBIO == NULL) {
             error() << "failed to allocate BIO object: "
@@ -684,7 +709,16 @@ namespace mongo {
             return false;
         }
 
-        X509* x509 = PEM_read_bio_X509(inBIO, NULL, &SSLManager::password_cb, this);
+        X509* x509;
+        if(clusterCert) {
+            x509 = PEM_read_bio_X509(inBIO, NULL, &SSLManager::cluster_password_cb, this);
+        }
+
+        else {
+            x509 = PEM_read_bio_X509(inBIO, NULL, &SSLManager::pem_password_cb, this);
+        }
+
+
         if (x509 == NULL) {
             error() << "cannot retrieve certificate from keyfile: "
                     << keyFile << ' ' << getSSLErrorMessage(ERR_get_error()); 
@@ -720,8 +754,9 @@ namespace mongo {
     }
 
     bool SSLManager::_setupPEM(SSL_CTX* context, 
-                               const std::string& keyFile, 
-                               const std::string& password) {
+                               const std::string& keyFile,
+                               const std::string& password,
+                               bool clusterCert) {
 
         if ( SSL_CTX_use_certificate_chain_file( context , keyFile.c_str() ) != 1 ) {
             error() << "cannot read certificate file: " << keyFile << ' ' <<
@@ -732,7 +767,18 @@ namespace mongo {
         // If password is empty, use default OpenSSL callback, which uses the terminal
         // to securely request the password interactively from the user.
         SSL_CTX_set_default_passwd_cb_userdata( context , this );
-        SSL_CTX_set_default_passwd_cb( context, &SSLManager::password_cb );
+
+        if (clusterCert) {
+            _clusterPassword = password;
+            SSL_CTX_set_default_passwd_cb( context, &SSLManager::cluster_password_cb );
+        }
+        else {
+            if (_pemPassword.empty()) {
+                _pemPassword = password;
+            }
+
+            SSL_CTX_set_default_passwd_cb( context, &SSLManager::pem_password_cb );
+        }
 
         if ( SSL_CTX_use_PrivateKey_file( context , keyFile.c_str() , SSL_FILETYPE_PEM ) != 1 ) {
             error() << "cannot read PEM key file: " << keyFile << ' ' <<
