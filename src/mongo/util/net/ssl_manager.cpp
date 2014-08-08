@@ -588,16 +588,28 @@ namespace mongo {
  
         // Use the clusterfile for internal outgoing SSL connections if specified 
         if (context == &_clientContext && !params.clusterfile.empty()) {
-            EVP_set_pw_prompt("Enter cluster certificate passphrase");
+            if (params.clusterpwd.empty()) {
+                char buf[100];
+                EVP_read_pw_string(buf, 100, "Enter cluster certificate passphrase ", 0);
+                std::string bufstring(buf);
+                _password = bufstring;
+            }
             if (!_setupPEM(*context, params.clusterfile, params.clusterpwd)) {
                 return false;
             }
         }
         // Use the pemfile for everything else
         else if (!params.pemfile.empty()) {
-            EVP_set_pw_prompt("Enter PEM passphrase");
-            if (!_setupPEM(*context, params.pemfile, params.pempwd)) {
-                return false;
+            if (params.pempwd.empty()) {
+                if (_password.empty()) {
+                    char bufs[100];
+                    EVP_read_pw_string(bufs, 100, "Enter PEM passphrase ", 0);
+                    std::string bufstrings(bufs);
+                    _password = bufstrings;
+                }
+                if (!_setupPEM(*context, params.pemfile, params.pempwd)) {
+                    return false;
+                }
             }
         }
 
@@ -709,7 +721,6 @@ namespace mongo {
     bool SSLManager::_setupPEM(SSL_CTX* context, 
                                const std::string& keyFile, 
                                const std::string& password) {
-        _password = password;
 
         if ( SSL_CTX_use_certificate_chain_file( context , keyFile.c_str() ) != 1 ) {
             error() << "cannot read certificate file: " << keyFile << ' ' <<
@@ -719,10 +730,8 @@ namespace mongo {
 
         // If password is empty, use default OpenSSL callback, which uses the terminal
         // to securely request the password interactively from the user.
-        if (!password.empty()) {
-            SSL_CTX_set_default_passwd_cb_userdata( context , this );
-            SSL_CTX_set_default_passwd_cb( context, &SSLManager::password_cb );
-        }
+        SSL_CTX_set_default_passwd_cb_userdata( context , this );
+        SSL_CTX_set_default_passwd_cb( context, &SSLManager::password_cb );
  
         if ( SSL_CTX_use_PrivateKey_file( context , keyFile.c_str() , SSL_FILETYPE_PEM ) != 1 ) {
             error() << "cannot read PEM key file: " << keyFile << ' ' <<
