@@ -586,22 +586,32 @@ namespace mongo {
         // Disable session caching (see SERVER-10261)
         SSL_CTX_set_session_cache_mode(*context, SSL_SESS_CACHE_OFF);
  
+        log() << "at this point we are initializing stuff";
         // Use the clusterfile for internal outgoing SSL connections if specified 
         if (context == &_clientContext && !params.clusterfile.empty()) {
+            log() << "we have a clusterfile";
             if (params.clusterpwd.empty()) {
+                log() << "we don't have a clustfile password";
+                //this should exec once first if clusterfile is included.
                 char buf[100];
                 EVP_read_pw_string(buf, 100, "Enter cluster certificate passphrase ", 0);
                 std::string bufstring(buf);
                 _password = bufstring;
+                log() << "passord is now set thanks to clusterfile";
             }
             if (!_setupPEM(*context, params.clusterfile, params.clusterpwd)) {
                 return false;
             }
+            _password = "";
+            if(_password.empty())
+                log() << "yah it's empty";
+            log() << "where is failure";
         }
         // Use the pemfile for everything else
         else if (!params.pemfile.empty()) {
             if (params.pempwd.empty()) {
-                if (_password.empty()) {
+                //this should once if cluster twice otherwise
+                if (_password.empty() ) { //|| ((context == &_serverContext) && params.clusterfile.empty())){
                     char bufs[100];
                     EVP_read_pw_string(bufs, 100, "Enter PEM passphrase ", 0);
                     std::string bufstrings(bufs);
@@ -722,23 +732,24 @@ namespace mongo {
                                const std::string& keyFile, 
                                const std::string& password) {
 
+        log() << "error at beginning";
         if ( SSL_CTX_use_certificate_chain_file( context , keyFile.c_str() ) != 1 ) {
             error() << "cannot read certificate file: " << keyFile << ' ' <<
                 getSSLErrorMessage(ERR_get_error()) << endl;
             return false;
         }
-
+        log() << "next spot for error";
         // If password is empty, use default OpenSSL callback, which uses the terminal
         // to securely request the password interactively from the user.
         SSL_CTX_set_default_passwd_cb_userdata( context , this );
         SSL_CTX_set_default_passwd_cb( context, &SSLManager::password_cb );
- 
+        log() << "once again";
         if ( SSL_CTX_use_PrivateKey_file( context , keyFile.c_str() , SSL_FILETYPE_PEM ) != 1 ) {
             error() << "cannot read PEM key file: " << keyFile << ' ' <<
                 getSSLErrorMessage(ERR_get_error()) << endl;
             return false;
         }
- 
+        log() << "probs here";
         // Verify that the certificate and the key go together.
         if (SSL_CTX_check_private_key(context) != 1) {
             error() << "SSL certificate validation: " << getSSLErrorMessage(ERR_get_error()) 
